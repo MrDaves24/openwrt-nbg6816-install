@@ -1,0 +1,158 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Install OpenWrt on a Zyxel NBG6816 (Armor Z1) from its stock firmware, or back the stock
+# firmware up first. It runs on the stock firmware, read from stdin over SSH:
+#   ssh root@192.168.1.1 sh -s backup < nbg6816-install.sh > nbg6816-stock.tar
+#   ssh root@192.168.1.1 sh -s install < nbg6816-install.sh
+# install changes U-Boot's environment to boot the flash, else an initramfs fetched over TFTP
+# from the PC running this ssh, then erases the stock kernel: the next boot is that TFTP boot.
+# Every check comes before the first write, and the stock kernel is erased last: if the script
+# stops before that, the router still boots the stock firmware. See README.md.
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+say() { echo "$*" >&2; }
+die() { say "nbg6816-install: $*"; exit 1; }
+
+# The stock partitions, numbered as the stock kernel lists them (from U-Boot's mtdparts), and
+# HLOS through rootfs, which OpenWrt's firmware partition covers exactly
+ENV_MTD=3 HLOS_MTD=5 HEADER_MTD=7
+FIRMWARE="5:HLOS 6:dualflag 7:header 8:romd 9:rootfs_data 10:rootfs"
+FIRMWARE_SIZE=$((30848 * 1024))
+
+check_stock() {
+	for p in $ENV_MTD:env $FIRMWARE; do
+		[ "$(cat /sys/class/mtd/mtd${p%%:*}/name 2>/dev/null)" = "${p#*:}" ] ||
+			die "mtd${p%%:*} is not ${p#*:}: this is not the NBG6816's stock flash layout"
+	done
+	grep -q "^DISTRIB_TARGET=.ipq806x/nbg6816.$" /etc/openwrt_release 2>/dev/null ||
+		die "this is not the NBG6816's stock firmware"
+}
+
+do_backup() {
+	check_stock
+	d=/tmp/nbg6816-backup
+	# 30 MB of RAM, freed whatever happens
+	trap 'rm -rf $d' EXIT
+	rm -rf $d
+	mkdir $d
+	for p in $FIRMWARE; do
+		cat /dev/mtd${p%%:*} || die "reading mtd${p%%:*} failed"
+	done >$d/stock-firmware.bin
+	cat /dev/mtd$ENV_MTD >$d/stock-env.bin || die "reading mtd$ENV_MTD failed"
+	[ "$(wc -c <$d/stock-firmware.bin)" -eq $FIRMWARE_SIZE ] || die "the backup is short"
+	(cd $d && md5sum stock-firmware.bin stock-env.bin >md5sums) || die "md5sum failed"
+	tar -C $d -cf - stock-firmware.bin stock-env.bin md5sums || die "tar failed"
+	say "Backup done: stock-firmware.bin, stock-env.bin and their md5sums."
+}
+
+# U-Boot's environment, as Zyxel ships it and as install leaves it. ${...} are U-Boot's.
+FACTORY_BOOTCMD='run boot_flash'
+FACTORY_BOOT_FLASH='run setmtdparts flashargs addtty addmtd;sf probe;sf read ${loadaddr} ${kernel_paddr} ${kernel_psize};bootm ${loadaddr}'
+# Our kernel is past the 2 MB U-Boot reads: 10 MB, checked before it is booted, so that an
+# erased or half-written flash falls through to boot_tftp
+BOOT_FLASH='run setmtdparts flashargs addtty addmtd;sf probe;sf read ${loadaddr} ${kernel_paddr} 0xa00000;iminfo ${loadaddr} && bootm ${loadaddr}'
+# Neither U-Boot nor its zloader arms the watchdog, and one left running by a failed boot
+# survives the reset: disarmed first
+BOOTCMD='mw.l 0x0208a040 0; run boot_flash; run boot_tftp'
+# The watchdog for 240 s (32768 Hz): bark, bite, pet, enable. Armed before the transfer, so
+# that a PC that doesn't answer costs a reset and a new try, not U-Boot's 42-minute ARP wait;
+# armed again before bootm, until the kernel's driver takes it over.
+ARM_WATCHDOG='mw.l 0x0208a04c 0x780000; mw.l 0x0208a05c 0x780000; mw.l 0x0208a038 1; mw.l 0x0208a040 1'
+
+# boot_tftp ROUTER NETMASK PC: the addresses in RAM only, so the saved ones stay Zyxel's. The
+# load address is cleared first: a 0-byte transfer counts as a success. 1400-byte blocks, as the
+# net boot this was proven by (the default is 512).
+boot_tftp() {
+	echo "setenv ipaddr $1; setenv netmask $2; setenv serverip $3; setenv tftpblocksize 1400;" \
+		"mw.l \${loadaddr} 0 1; $ARM_WATCHDOG;" \
+		"if tftpboot \${loadaddr} nbg6816-initramfs.bin; then if iminfo \${loadaddr}; then" \
+		"$ARM_WATCHDOG; bootm \${loadaddr}; fi; fi"
+}
+
+quad() { echo "$1" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; }
+int() { (IFS=.; set -- $1; echo $((($1 << 24) | ($2 << 16) | ($3 << 8) | $4))); }
+# A variable's value, empty if it isn't set
+getenv() { fw_printenv -n "$1" 2>/dev/null || true; }
+
+do_install() {
+	untested=
+	case "${1:-}" in
+	"") ;;
+	--untested-version) untested=1 ;;
+	*) die "unknown option: $1" ;;
+	esac
+	check_stock
+
+	version=$(strings /dev/mtd$HEADER_MTD | grep -o 'V1\.00([A-Z]*\.[0-9]*)C0' | head -1)
+	if [ "$version" != "V1.00(AAWB.12)C0" ] && [ -z "$untested" ]; then
+		say "This router runs the stock firmware ${version:-of an unknown version}; only"
+		say "V1.00(AAWB.12)C0 was tested. It could work: at worst, the router restarts into its"
+		say "stock firmware, unchanged, and OpenWrt can't be installed this way. To try, run"
+		say "the script again with: sh -s install --untested-version"
+		exit 1
+	fi
+
+	printenv=$(fw_printenv 2>&1) || die "fw_printenv can't read U-Boot's environment: nothing written"
+	case "$printenv" in *"Bad CRC"*) die "U-Boot's environment has a bad CRC: nothing written" ;; esac
+	# Each variable as Zyxel ships it or as this script writes it: a run that stopped halfway
+	# can be run again
+	case "$(getenv bootcmd)" in "$FACTORY_BOOTCMD" | "$BOOTCMD") ;; *) changed=1 ;; esac
+	case "$(getenv boot_flash)" in "$FACTORY_BOOT_FLASH" | "$BOOT_FLASH") ;; *) changed=1 ;; esac
+	[ -z "${changed:-}" ] || die "U-Boot's environment isn't the factory one: nothing written"
+
+	# The router's address for U-Boot is the stock firmware's own on the LAN, which nothing
+	# else there holds; the PC's is the one this ssh comes from
+	set -- ${SSH_CONNECTION:-}
+	[ $# -eq 4 ] || die "run it over ssh (SSH_CONNECTION is not set)"
+	# An IPv4 client on a dual-stack socket shows as ::ffff:a.b.c.d
+	pc=${1#::ffff:} router=${3#::ffff:}
+	lan=$(ifconfig br-lan) || die "the router has no LAN bridge (br-lan)"
+	lan_ip=$(echo "$lan" | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p')
+	mask=$(echo "$lan" | sed -n 's/.*Mask:\([0-9.]*\).*/\1/p')
+	quad "$pc" || die "the PC's address isn't IPv4 ($pc): connect to the router's IPv4 address"
+	quad "$lan_ip" && quad "$mask" || die "the router has no IPv4 address on its LAN"
+	[ "$router" = "$lan_ip" ] ||
+		die "connect to the router's LAN address, $lan_ip, from a PC on its LAN ports"
+	[ $(($(int "$pc") & $(int "$mask"))) -eq $(($(int "$router") & $(int "$mask"))) ] &&
+		[ "$pc" != "$router" ] || die "the PC ($pc) isn't on the router's LAN ($router/$mask)"
+
+	ko=/tmp/env_rw.ko
+	trap 'rm -f $ko' EXIT
+	openssl enc -d -base64 >$ko <<'EOF' || die "decoding the embedded module failed: nothing written"
+@ENV_RW_KO@
+EOF
+	[ "$(openssl dgst -sha256 <$ko | sed 's/.*= *//')" = @ENV_RW_SHA256@ ] ||
+		die "the embedded module is corrupt: nothing written"
+	insmod $ko || die "the module didn't load on this kernel: nothing written"
+	trap 'rmmod env_rw 2>/dev/null; rm -f $ko' EXIT
+	[ $(($(cat /sys/class/mtd/mtd$ENV_MTD/flags) & 0x400)) -ne 0 ] ||
+		die "U-Boot's environment is still read-only: nothing written"
+
+	tftp=$(boot_tftp "$router" "$mask" "$pc")
+	# bootcmd last: until it is written, the router boots as before (boot_flash still boots the
+	# stock kernel). A write that breaks the CRC makes U-Boot use its built-in environment, which
+	# boots the stock firmware too (read in its binary).
+	failed="writing U-Boot's environment failed; the stock kernel is kept, so the router still boots the stock firmware, and the script can be run again"
+	fw_setenv boot_flash "$BOOT_FLASH" || die "$failed"
+	fw_setenv boot_tftp "$tftp" || die "$failed"
+	fw_setenv bootcmd "$BOOTCMD" || die "$failed"
+	[ "$(getenv boot_flash)" = "$BOOT_FLASH" ] && [ "$(getenv boot_tftp)" = "$tftp" ] &&
+		[ "$(getenv bootcmd)" = "$BOOTCMD" ] ||
+		die "U-Boot's environment doesn't read back as written: don't reboot, ask for help"
+	rmmod env_rw
+	trap 'rm -f $ko' EXIT
+
+	mtd erase HLOS >&2 ||
+		die "erasing the stock kernel failed: it may be partly erased, so reboot with the TFTP server running, as after an install"
+	[ "$(hexdump -n 4 -e '1/4 "%08x"' /dev/mtd$HLOS_MTD)" = ffffffff ] ||
+		die "the stock kernel isn't erased: the router still boots the stock firmware"
+	say "Done. At its next boot the router fetches nbg6816-initramfs.bin over TFTP from"
+	say "$pc, as $router. Start the TFTP server, then reboot the router."
+}
+
+case "${1:-}" in
+backup) do_backup ;;
+install) shift; do_install "$@" ;;
+*) die "usage: sh -s backup|install [--untested-version]" ;;
+esac

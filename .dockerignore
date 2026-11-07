@@ -1,0 +1,4 @@
+*
+!env-rw
+!nbg6816-install.sh.in
+!env_rw.ko.sha256

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Test stand-in for the stock kernel unloading env_rw: env read-only again
+echo "rmmod $*" >>/t/calls
+echo 0x800 >/sys/class/mtd/mtd3/flags

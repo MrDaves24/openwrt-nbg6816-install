@@ -1,0 +1,4 @@
+#!/bin/sh
+# Test stand-in for the stock firmware's LAN bridge, as its ifconfig prints it
+[ "$*" = br-lan ] || exit 1
+cat /t/ifconfig

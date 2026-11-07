@@ -1,0 +1,6 @@
+#!/bin/sh
+# Test stand-in for the stock mtd erasing a partition: only HLOS is expected
+echo "mtd $*" >>/t/calls
+[ "$*" = "erase HLOS" ] || exit 1
+[ ! -e /t/erase-fails ] || exit 1
+cat /t/ff >/dev/mtd5

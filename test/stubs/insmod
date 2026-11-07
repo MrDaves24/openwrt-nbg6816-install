@@ -1,0 +1,6 @@
+#!/bin/sh
+# Test stand-in for the stock kernel loading env_rw: env becomes writeable
+echo "insmod $*" >>/t/calls
+cp "$1" /t/insmod.ko
+[ ! -e /t/insmod-fails ] || exit 1
+[ -e /t/env-stays-ro ] || echo 0xc00 >/sys/class/mtd/mtd3/flags
