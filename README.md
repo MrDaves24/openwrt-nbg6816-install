@@ -8,9 +8,8 @@ it loads to do so.
 
 **The install guide** is the installation section of OpenWrt's commit adding the device,
 "ipq806x: add support for Zyxel NBG6816". In short: turn SSH on in the stock web interface, run
-the script over SSH (`backup` first if you may want the stock firmware back, then `install`),
-reboot into OpenWrt's initramfs served by a TFTP server on your PC, then `sysupgrade -n`. Get
-`nbg6816-install.sh` from this repo's releases.
+the script over SSH (`backup` first, then `install`), reboot into OpenWrt's initramfs served by a
+TFTP server on your PC, then `sysupgrade -n`. Get `nbg6816-install.sh` from this repo's releases.
 
 ## What the script does
 
